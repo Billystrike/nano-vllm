@@ -31,10 +31,10 @@ def store_kvcache_kernel(
 
 
 def store_kvcache(key: torch.Tensor, value: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor, slot_mapping: torch.Tensor):
-    N, num_heads, head_dim = key.shape
+    N, num_heads, head_dim = key.shape#N:写入kv_cache的token数
     D = num_heads * head_dim
-    assert key.stride(-1) == 1 and value.stride(-1) == 1
-    assert key.stride(1) == head_dim and value.stride(1) == head_dim
+    assert key.stride(-1) == 1 and value.stride(-1) == 1#检查key和value的最后一个维度是连续的，即head_dim维度是连续存储的
+    assert key.stride(1) == head_dim and value.stride(1) == head_dim#检查key和value的第二个维度是head_dim的倍数，即num_heads维度是连续存储的
     assert k_cache.stride(1) == D and v_cache.stride(1) == D
     assert slot_mapping.numel() == N
     store_kvcache_kernel[(N,)](key, key.stride(0), value, value.stride(0), k_cache, v_cache, slot_mapping, D)
@@ -60,7 +60,7 @@ class Attention(nn.Module):
         context = get_context()
         k_cache, v_cache = self.k_cache, self.v_cache
         if k_cache.numel() and v_cache.numel():
-            store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
+            store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)#将当前步的k和v存入当前层的k_cache和v_cache中，slot_mapping指示了每个序列对应的块ID和块内位置
         if context.is_prefill:
             if context.block_tables is not None:    # prefix cache
                 k, v = k_cache, v_cache

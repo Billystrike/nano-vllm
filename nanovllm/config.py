@@ -6,9 +6,9 @@ from transformers import AutoConfig
 @dataclass(slots=True)
 class Config:
     model: str
-    max_num_batched_tokens: int = 16384
-    max_num_seqs: int = 512
-    max_model_len: int = 4096
+    max_num_batched_tokens: int = 16384#单次前向传播中，整个批次所有序列的 Token 总数的最大上限。
+    max_num_seqs: int = 512#同时处理的请求数量（并发数）的最大上限。
+    max_model_len: int = 4096#模型所能支持的单条序列的最大长度（prefill+decode)
     gpu_memory_utilization: float = 0.9
     tensor_parallel_size: int = 1
     enforce_eager: bool = False

@@ -199,7 +199,7 @@ class Qwen3ForCausalLM(nn.Module):
         super().__init__()
         self.model = Qwen3Model(config)
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
-        if config.tie_word_embeddings:
+        if config.tie_word_embeddings:#绑定词嵌入和语言模型头部的权重
             self.lm_head.weight.data = self.model.embed_tokens.weight.data
 
     def forward(

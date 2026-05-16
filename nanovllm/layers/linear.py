@@ -10,7 +10,9 @@ def divide(numerator, denominator):
 
 
 class LinearBase(nn.Module):
-
+    '''
+    所有并行线性层的基类。初始化时获取分布式信息（tp_rank, tp_size），预留权重定义，并动态挂载 weight_loader。
+    '''
     def __init__(
         self,
         input_size: int,
@@ -35,7 +37,9 @@ class LinearBase(nn.Module):
 
 
 class ReplicatedLinear(LinearBase):
-
+    '''
+    无并行的普通线性层。每张卡保留完整权重，weight_loader 直接全量拷贝。
+    '''
     def __init__(
         self,
         input_size: int,
@@ -52,7 +56,9 @@ class ReplicatedLinear(LinearBase):
 
 
 class ColumnParallelLinear(LinearBase):
-
+    ''''
+    标准列并行。__init__ 中将 output_size 除以 tp_size；weight_loader 用 narrow 沿第0维切取对应的行块。
+    '''
     def __init__(
         self,
         input_size: int,
@@ -74,7 +80,9 @@ class ColumnParallelLinear(LinearBase):
 
 
 class MergedColumnParallelLinear(ColumnParallelLinear):
-
+    '''
+    合并列并行（常用于 MLP 的 gate_up_proj）。逻辑上将多个独立的全连接层（如 gate 和 up）拼成一个大矩阵一次计算
+    '''
     def __init__(
         self,
         input_size: int,
@@ -85,6 +93,9 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         super().__init__(input_size, sum(output_sizes), bias)
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor, loaded_shard_id: int):
+        '''
+        weight_loader 需要根据 loaded_shard_id 计算该子层在合并后大矩阵中的偏移量（shard_offset），再进行切分加载。
+        '''
         param_data = param.data
         shard_offset = sum(self.output_sizes[:loaded_shard_id]) // self.tp_size
         shard_size = self.output_sizes[loaded_shard_id] // self.tp_size
@@ -94,7 +105,9 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
 
 
 class QKVParallelLinear(ColumnParallelLinear):
-
+    '''
+    QKV 合并列并行（用于 Attention 的 qkv_proj）
+    '''
     def __init__(
         self,
         hidden_size: int,
@@ -112,6 +125,9 @@ class QKVParallelLinear(ColumnParallelLinear):
         super().__init__(hidden_size, output_size, bias)
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor, loaded_shard_id: str):
+        '''
+        由于 GQA下 Q、K、V 的 head 数可能不同，它们的切分大小不一样。weight_loader 需根据 loaded_shard_id分别计算不同的大小（shard_size）和偏移量，再切分加载。
+        '''
         param_data = param.data
         assert loaded_shard_id in ["q", "k", "v"]
         if loaded_shard_id == "q":
@@ -129,17 +145,22 @@ class QKVParallelLinear(ColumnParallelLinear):
 
 
 class RowParallelLinear(LinearBase):
-
+    '''
+    行并行 将权重矩阵沿输入维度（第1维，列）切分。每张卡持有部分列，接收部分输入。
+    '''
     def __init__(
         self,
         input_size: int,
         output_size: int,
         bias: bool = False,
-    ):
+    ):#将 input_size 除以 tp_size，tp_dim=1
         tp_size = dist.get_world_size()
         super().__init__(divide(input_size, tp_size), output_size, bias, 1)
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
+        '''
+        对 2D 权重沿第1维切分加载；对 1D 偏置直接全量拷贝
+        '''
         param_data = param.data
         if param_data.ndim == 1:
             param_data.copy_(loaded_weight)
@@ -150,6 +171,9 @@ class RowParallelLinear(LinearBase):
         param_data.copy_(loaded_weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        '''
+        因为每张卡只算出了部分结果，必须通过 dist.all_reduce(y) 跨卡通信求和，才能还原最终完整的输出。偏置只在 tp_rank==0 上加，防止 all_reduce 后偏置被重复加了多次。
+        '''
         y = F.linear(x, self.weight, self.bias if self.tp_rank == 0 else None)
         if self.tp_size > 1:
             dist.all_reduce(y)

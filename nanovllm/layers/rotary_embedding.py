@@ -26,12 +26,12 @@ class RotaryEmbedding(nn.Module):
         super().__init__()
         self.head_size = head_size
         assert rotary_dim == head_size
-        inv_freq = 1.0 / (base**(torch.arange(0, rotary_dim, 2, dtype=torch.float) / rotary_dim))
-        t = torch.arange(max_position_embeddings, dtype=torch.float)
-        freqs = torch.einsum("i,j -> ij", t, inv_freq)
+        inv_freq = 1.0 / (base**(torch.arange(0, rotary_dim, 2, dtype=torch.float) / rotary_dim))#表示每个偶数维度的旋转频率，频率随着维度增加而增加
+        t = torch.arange(max_position_embeddings, dtype=torch.float)#表示一个token的绝对位置
+        freqs = torch.einsum("i,j -> ij", t, inv_freq)#计算每个位置和每个频率的乘积，得到一个形状为 (max_position_embeddings, rotary_dim // 2) 的矩阵，其中每行表示一个绝对位置的旋转频率
         cos = freqs.cos()
         sin = freqs.sin()
-        cache = torch.cat((cos, sin), dim=-1).unsqueeze_(1)
+        cache = torch.cat((cos, sin), dim=-1).unsqueeze_(1)#将 cos 和 sin 沿最后一个维度拼接，得到一个形状为 (max_position_embeddings, 1, rotary_dim) 的矩阵，其中每行表示一个绝对位置的旋转频率的余弦和正弦值。然后使用 unsqueeze_ 在第二个维度添加一个维度，以便在后续计算中与 query 和 key 的形状匹配。
         self.register_buffer("cos_sin_cache", cache, persistent=False)
 
     @torch.compile

@@ -41,13 +41,13 @@ class BlockManager:
         return h.intdigest()
 
     def _allocate_block(self) -> int:
-        block_id = self.free_block_ids.popleft()
-        block = self.blocks[block_id]
-        assert block.ref_count == 0
-        if block.hash != -1 and self.hash_to_block_id.get(block.hash) == block_id:
+        block_id = self.free_block_ids.popleft()#从空闲块列表中取出一个块ID
+        block = self.blocks[block_id]#根据块ID获取块对象
+        assert block.ref_count == 0#确保块未被使用
+        if block.hash != -1 and self.hash_to_block_id.get(block.hash) == block_id:#如果块的哈希值不为-1且哈希值对应的块ID是当前块ID，说明该块之前被使用过，需要从哈希表中删除对应关系
             del self.hash_to_block_id[block.hash]
-        block.reset()
-        self.used_block_ids.add(block_id)
+        block.reset()#重置块的状态，ref_count设为1，hash设为-1，token_ids清空
+        self.used_block_ids.add(block_id)#将块ID添加到已使用块ID集合中
         return block_id
 
     def _deallocate_block(self, block_id: int):

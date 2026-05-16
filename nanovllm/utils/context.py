@@ -5,13 +5,13 @@ import torch
 @dataclass(slots=True)
 class Context:
     is_prefill: bool = False
-    cu_seqlens_q: torch.Tensor | None = None
-    cu_seqlens_k: torch.Tensor | None = None
-    max_seqlen_q: int = 0
-    max_seqlen_k: int = 0
-    slot_mapping: torch.Tensor | None = None
-    context_lens: torch.Tensor | None = None
-    block_tables: torch.Tensor | None = None
+    cu_seqlens_q: torch.Tensor | None = None#cumulative sequence lengths of the sequences in the batch used to index into q
+    cu_seqlens_k: torch.Tensor | None = None#The cumulative sequence lengths of of the sequences in the batch, used to index into kv.
+    max_seqlen_q: int = 0#Maximum query sequence length in the batch.
+    max_seqlen_k: int = 0#Maximum key/value sequence length in the batch.
+    slot_mapping: torch.Tensor | None = None#记录每个token在KV缓存中的位置索引。
+    context_lens: torch.Tensor | None = None#记录每条序列的上下文长度。
+    block_tables: torch.Tensor | None = None#记录每条序列使用KV block 索引表。
 
 _CONTEXT = Context()
 

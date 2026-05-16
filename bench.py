@@ -1,8 +1,8 @@
 import os
 import time
 from random import randint, seed
-from nanovllm import LLM, SamplingParams
-# from vllm import LLM, SamplingParams
+# from nanovllm import LLM, SamplingParams
+from vllm import LLM, SamplingParams
 
 
 def main():
@@ -11,13 +11,13 @@ def main():
     max_input_len = 1024
     max_ouput_len = 1024
 
-    path = os.path.expanduser("~/huggingface/Qwen3-0.6B/")
-    llm = LLM(path, enforce_eager=False, max_model_len=4096)
+    path = os.path.expanduser("/home/bstrike/huggingface/models--Qwen--Qwen3-1.7B")
+    llm = LLM(path, enforce_eager=False, max_model_len=4096, gpu_memory_utilization=0.80)
 
     prompt_token_ids = [[randint(0, 10000) for _ in range(randint(100, max_input_len))] for _ in range(num_seqs)]
     sampling_params = [SamplingParams(temperature=0.6, ignore_eos=True, max_tokens=randint(100, max_ouput_len)) for _ in range(num_seqs)]
-    # uncomment the following line for vllm
-    # prompt_token_ids = [dict(prompt_token_ids=p) for p in prompt_token_ids]
+    # uncomment the following line for vllm 解除下面注释使用原版vllm
+    prompt_token_ids = [dict(prompt_token_ids=p) for p in prompt_token_ids]
 
     llm.generate(["Benchmark: "], SamplingParams())
     t = time.time()

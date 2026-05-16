@@ -1,17 +1,18 @@
 import os
 from nanovllm import LLM, SamplingParams
 from transformers import AutoTokenizer
-
+import torch._dynamo
+torch._dynamo.config.suppress_errors = True # 遇到编译错误自动回退到 eager模式(用来Debug添加的)
 
 def main():
-    path = os.path.expanduser("~/huggingface/Qwen3-0.6B/")
+    path = os.path.expanduser("/home/bstrike/huggingface/models--Qwen--Qwen3-1.7B")
     tokenizer = AutoTokenizer.from_pretrained(path)
     llm = LLM(path, enforce_eager=True, tensor_parallel_size=1)
 
-    sampling_params = SamplingParams(temperature=0.6, max_tokens=256)
+    sampling_params = SamplingParams(temperature=0.3, max_tokens=256)
     prompts = [
-        "introduce yourself",
-        "list all prime numbers within 100",
+        "介绍一下什么是triton",
+        "力扣第一题两数之和有什么较好的解法",
     ]
     prompts = [
         tokenizer.apply_chat_template(

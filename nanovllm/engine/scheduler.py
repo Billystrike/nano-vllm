@@ -32,7 +32,7 @@ class Scheduler:
             remaining = self.max_num_batched_tokens - num_batched_tokens
             if remaining == 0:
                 break
-            if not seq.block_table:
+            if not seq.block_table:#如果序列没有块表，说明是第一次调度，需要计算可以复用的块数量
                 num_cached_blocks = self.block_manager.can_allocate(seq)
                 if num_cached_blocks == -1:
                     break
@@ -41,7 +41,7 @@ class Scheduler:
                 num_tokens = seq.num_tokens - seq.num_cached_tokens
             if remaining < num_tokens and scheduled_seqs:  # only allow chunked prefill for the first seq
                 break
-            if not seq.block_table:
+            if not seq.block_table:#如果序列没有块表，说明是第一次调度，需要分配块
                 self.block_manager.allocate(seq, num_cached_blocks)
             seq.num_scheduled_tokens = min(num_tokens, remaining)
             num_batched_tokens += seq.num_scheduled_tokens
@@ -72,7 +72,7 @@ class Scheduler:
         self.running.extendleft(reversed(scheduled_seqs))
         return scheduled_seqs, False
 
-    def preempt(self, seq: Sequence):
+    def preempt(self, seq: Sequence):#当解码阶段的序列无法继续调度时，调用该函数将其抢占回预填充阶段，以腾出块资源给其他序列
         seq.status = SequenceStatus.WAITING
         seq.is_prefill = True
         self.block_manager.deallocate(seq)

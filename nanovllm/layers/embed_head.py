@@ -57,7 +57,7 @@ class ParallelLMHead(VocabParallelEmbedding):
         context = get_context()
         if context.is_prefill:
             last_indices = context.cu_seqlens_q[1:] - 1
-            x = x[last_indices].contiguous()
+            x = x[last_indices].contiguous()#prefill阶段每条序列只计算新增的token，所以每条序列的输出对应的logits也只需要取最后一个token的位置。
         logits = F.linear(x, self.weight)
         if self.tp_size > 1:
             all_logits = [torch.empty_like(logits) for _ in range(self.tp_size)] if self.tp_rank == 0 else None
