@@ -7,7 +7,7 @@ torch._dynamo.config.suppress_errors = True # 遇到编译错误自动回退到 
 def main():
     path = os.path.expanduser("/home/bstrike/huggingface/models--Qwen--Qwen3-1.7B")
     tokenizer = AutoTokenizer.from_pretrained(path)
-    llm = LLM(path, enforce_eager=True, tensor_parallel_size=1)
+    llm = LLM(path, enforce_eager=False, tensor_parallel_size=1)
 
     sampling_params = SamplingParams(temperature=0.3, max_tokens=256)
     prompts = [

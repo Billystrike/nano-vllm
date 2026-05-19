@@ -18,7 +18,9 @@ class LLMEngine:
         config_fields = {field.name for field in fields(Config)}
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
         config = Config(model, **config_kwargs)
+        self.config = config
         Sequence.block_size = config.kvcache_block_size
+        self.seqs: dict[int, Sequence] = {}
         self.ps = []
         self.events = []
         ctx = mp.get_context("spawn")
@@ -44,15 +46,43 @@ class LLMEngine:
         if isinstance(prompt, str):
             prompt = self.tokenizer.encode(prompt)
         seq = Sequence(prompt, sampling_params)
+        seq.submit_time = perf_counter()
+        self.seqs[seq.seq_id] = seq
         self.scheduler.add(seq)
+        return seq.seq_id
 
     def step(self):
-        seqs, is_prefill = self.scheduler.schedule()
-        num_tokens = sum(seq.num_scheduled_tokens for seq in seqs) if is_prefill else -len(seqs)
-        token_ids = self.model_runner.call("run", seqs, is_prefill)
-        self.scheduler.postprocess(seqs, token_ids, is_prefill)#将计算得到的token_ids存入对应的序列中，并更新块表和状态
-        outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
-        return outputs, num_tokens
+        outputs = []
+        prefill_tokens = 0
+        prefill_time = 0.0
+        decode_tokens = 0
+        decode_time = 0.0
+
+        prefill_seqs = self.scheduler.schedule_prefill()
+        if prefill_seqs:
+            # Prefill run (varlen) executes before decode in the same step.
+            prefill_tokens = sum(seq.num_scheduled_tokens for seq in prefill_seqs)
+            t0 = perf_counter()
+            token_ids = self.model_runner.call("run", prefill_seqs, True)
+            prefill_time = perf_counter() - t0
+            self.scheduler.postprocess(prefill_seqs, token_ids, True, perf_counter())#将计算得到的token_ids存入对应的序列中，并更新块表和状态
+            outputs.extend([(seq.seq_id, seq.completion_token_ids) for seq in prefill_seqs if seq.is_finished])
+
+        if (not self.config.prefill_decode_mix) and prefill_seqs:
+            return outputs, prefill_tokens, prefill_time, decode_tokens, decode_time
+
+        decode_limit = self.config.decode_max_num_seqs or None
+        decode_seqs = self.scheduler.schedule_decode(decode_limit)
+        if decode_seqs:
+            # Decode run is a separate forward pass to keep prefill kernels unchanged.
+            decode_tokens = len(decode_seqs)
+            t0 = perf_counter()
+            token_ids = self.model_runner.call("run", decode_seqs, False)
+            decode_time = perf_counter() - t0
+            self.scheduler.postprocess(decode_seqs, token_ids, False, perf_counter())#将计算得到的token_ids存入对应的序列中，并更新块表和状态
+            outputs.extend([(seq.seq_id, seq.completion_token_ids) for seq in decode_seqs if seq.is_finished])
+
+        return outputs, prefill_tokens, prefill_time, decode_tokens, decode_time
 
     def is_finished(self):
         return self.scheduler.is_finished()
@@ -71,12 +101,11 @@ class LLMEngine:
         outputs = {}
         prefill_throughput = decode_throughput = 0.
         while not self.is_finished():
-            t = perf_counter()
-            output, num_tokens = self.step()
-            if num_tokens > 0:
-                prefill_throughput = num_tokens / (perf_counter() - t)
-            else:
-                decode_throughput = -num_tokens / (perf_counter() - t)
+            output, prefill_tokens, prefill_time, decode_tokens, decode_time = self.step()
+            if prefill_tokens > 0 and prefill_time > 0:
+                prefill_throughput = prefill_tokens / prefill_time
+            if decode_tokens > 0 and decode_time > 0:
+                decode_throughput = decode_tokens / decode_time
             pbar.set_postfix({
                 "Prefill": f"{int(prefill_throughput)}tok/s",
                 "Decode": f"{int(decode_throughput)}tok/s",

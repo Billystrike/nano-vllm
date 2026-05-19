@@ -10,6 +10,7 @@ class Scheduler:
     def __init__(self, config: Config):
         self.max_num_seqs = config.max_num_seqs
         self.max_num_batched_tokens = config.max_num_batched_tokens
+        self.prefill_chunk_size = config.prefill_chunk_size
         self.eos = config.eos
         self.block_size = config.kvcache_block_size
         self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size)
@@ -22,12 +23,14 @@ class Scheduler:
     def add(self, seq: Sequence):
         self.waiting.append(seq)
 
-    def schedule(self) -> tuple[list[Sequence], bool]:
+    def schedule_prefill(self) -> list[Sequence]:
         scheduled_seqs = []
         num_batched_tokens = 0
 
         # prefill
-        while self.waiting and len(scheduled_seqs) < self.max_num_seqs:
+        num_waiting = len(self.waiting)
+        # NOTE: num_waiting prevents scheduling the same seq twice in one step.
+        while self.waiting and len(scheduled_seqs) < self.max_num_seqs and num_waiting > 0:
             seq = self.waiting[0]
             remaining = self.max_num_batched_tokens - num_batched_tokens
             if remaining == 0:
@@ -39,24 +42,33 @@ class Scheduler:
                 num_tokens = seq.num_tokens - num_cached_blocks * self.block_size
             else:
                 num_tokens = seq.num_tokens - seq.num_cached_tokens
-            if remaining < num_tokens and scheduled_seqs:  # only allow chunked prefill for the first seq
+            # Cap per-step work for this seq to enable chunked prefill.
+            scheduled_tokens = min(num_tokens, remaining)
+            if self.prefill_chunk_size > 0:
+                scheduled_tokens = min(scheduled_tokens, self.prefill_chunk_size)
+            if scheduled_tokens == 0:
                 break
             if not seq.block_table:#如果序列没有块表，说明是第一次调度，需要分配块
+                # Allocate the full block table once (not on-demand per chunk).
                 self.block_manager.allocate(seq, num_cached_blocks)
-            seq.num_scheduled_tokens = min(num_tokens, remaining)
+            seq.num_scheduled_tokens = scheduled_tokens
             num_batched_tokens += seq.num_scheduled_tokens
+            self.waiting.popleft()
             if seq.num_cached_tokens + seq.num_scheduled_tokens == seq.num_tokens:
                 seq.status = SequenceStatus.RUNNING
-                self.waiting.popleft()
                 self.running.append(seq)
+            else:
+                self.waiting.append(seq)
             scheduled_seqs.append(seq)
+            num_waiting -= 1
+        return scheduled_seqs
 
-        if scheduled_seqs:
-            return scheduled_seqs, True
-
-        # decode
-        while self.running and len(scheduled_seqs) < self.max_num_seqs:
+    def schedule_decode(self, max_num_seqs: int | None = None) -> list[Sequence]:
+        scheduled_seqs = []
+        limit = self.max_num_seqs if not max_num_seqs else min(max_num_seqs, self.max_num_seqs)
+        while self.running and len(scheduled_seqs) < limit:
             seq = self.running.popleft()
+            # Preempt if we cannot append KV for this seq.
             while not self.block_manager.can_append(seq):
                 if self.running:
                     self.preempt(self.running.pop())
@@ -68,8 +80,16 @@ class Scheduler:
                 seq.is_prefill = False
                 self.block_manager.may_append(seq)
                 scheduled_seqs.append(seq)
+        if scheduled_seqs:
+            self.running.extendleft(reversed(scheduled_seqs))
+        return scheduled_seqs
+
+    def schedule(self) -> tuple[list[Sequence], bool]:
+        scheduled_seqs = self.schedule_prefill()
+        if scheduled_seqs:
+            return scheduled_seqs, True
+        scheduled_seqs = self.schedule_decode()
         assert scheduled_seqs
-        self.running.extendleft(reversed(scheduled_seqs))
         return scheduled_seqs, False
 
     def preempt(self, seq: Sequence):#当解码阶段的序列无法继续调度时，调用该函数将其抢占回预填充阶段，以腾出块资源给其他序列
@@ -78,15 +98,19 @@ class Scheduler:
         self.block_manager.deallocate(seq)
         self.waiting.appendleft(seq)
 
-    def postprocess(self, seqs: list[Sequence], token_ids: list[int], is_prefill: bool):
+    def postprocess(self, seqs: list[Sequence], token_ids: list[int], is_prefill: bool, now: float | None = None):
         for seq, token_id in zip(seqs, token_ids):
             self.block_manager.hash_blocks(seq)
             seq.num_cached_tokens += seq.num_scheduled_tokens
             seq.num_scheduled_tokens = 0
             if is_prefill and seq.num_cached_tokens < seq.num_tokens:
                 continue
+            if now is not None and seq.first_token_time is None:
+                seq.first_token_time = now
             seq.append_token(token_id)
             if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens:
                 seq.status = SequenceStatus.FINISHED
                 self.block_manager.deallocate(seq)
                 self.running.remove(seq)
+                if now is not None:
+                    seq.end_time = now
