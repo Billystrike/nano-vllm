@@ -1,4 +1,6 @@
 import atexit
+import json
+import time
 from dataclasses import fields
 from time import perf_counter
 from tqdm.auto import tqdm
@@ -34,13 +36,63 @@ class LLMEngine:
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         config.eos = self.tokenizer.eos_token_id
         self.scheduler = Scheduler(config)
+        self._profiling_enabled = config.enable_profiling
+        if self._profiling_enabled:
+            # Accumulate profiling stats and flush to jsonl on an interval.
+            self._profile_interval_s = config.profiling_interval_s
+            self._profile_path = config.profiling_path
+            self._profile_fh = open(self._profile_path, "a", encoding="utf-8")
+            self._profile_last_flush = perf_counter()
+            self._profile_acc = self._new_profile_acc()
         atexit.register(self.exit)
 
     def exit(self):
         self.model_runner.call("exit")
         del self.model_runner
+        if self._profiling_enabled:
+            self._profile_fh.close()
         for p in self.ps:
             p.join()
+
+    def _new_profile_bucket(self):
+        return {
+            "steps": 0,
+            "tokens": 0,
+            "prepare_ms": 0.0,
+            "run_model_ms": 0.0,
+            "sampler_ms": 0.0,
+            "postprocess_ms": 0.0,
+        }
+
+    def _new_profile_acc(self):
+        return {
+            "prefill": self._new_profile_bucket(),
+            "decode": self._new_profile_bucket(),
+        }
+
+    def _profile_add(self, kind: str, profile: dict, postprocess_ms: float, tokens: int):
+        bucket = self._profile_acc[kind]
+        bucket["steps"] += 1
+        bucket["tokens"] += tokens
+        bucket["prepare_ms"] += profile.get("prepare_ms", 0.0)
+        bucket["run_model_ms"] += profile.get("run_model_ms", 0.0)
+        bucket["sampler_ms"] += profile.get("sampler_ms", 0.0)
+        bucket["postprocess_ms"] += postprocess_ms
+
+    def _maybe_flush_profile(self):
+        now = perf_counter()
+        if now - self._profile_last_flush < self._profile_interval_s:
+            return
+        payload = {
+            "ts": time.time(),
+            "interval_s": now - self._profile_last_flush,
+            "prefill": self._profile_acc["prefill"],
+            "decode": self._profile_acc["decode"],
+        }
+        self._profile_fh.write(json.dumps(payload, ensure_ascii=True) + "\n")
+        self._profile_fh.flush()
+        self._profile_last_flush = now
+        self._profile_acc = self._new_profile_acc()
 
     def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
         if isinstance(prompt, str):
@@ -63,12 +115,22 @@ class LLMEngine:
             # Prefill run (varlen) executes before decode in the same step.
             prefill_tokens = sum(seq.num_scheduled_tokens for seq in prefill_seqs)
             t0 = perf_counter()
-            token_ids = self.model_runner.call("run", prefill_seqs, True)
+            if self._profiling_enabled:
+                token_ids, profile = self.model_runner.call("run_profiled", prefill_seqs, True)
+            else:
+                token_ids = self.model_runner.call("run", prefill_seqs, True)
             prefill_time = perf_counter() - t0
+            t_post = perf_counter()
             self.scheduler.postprocess(prefill_seqs, token_ids, True, perf_counter())#将计算得到的token_ids存入对应的序列中，并更新块表和状态
+            postprocess_ms = (perf_counter() - t_post) * 1000.0
+            if self._profiling_enabled:
+                # Keep profiling separate from throughput timing to avoid changing behavior.
+                self._profile_add("prefill", profile, postprocess_ms, prefill_tokens)
             outputs.extend([(seq.seq_id, seq.completion_token_ids) for seq in prefill_seqs if seq.is_finished])
 
         if (not self.config.prefill_decode_mix) and prefill_seqs:
+            if self._profiling_enabled:
+                self._maybe_flush_profile()
             return outputs, prefill_tokens, prefill_time, decode_tokens, decode_time
 
         decode_limit = self.config.decode_max_num_seqs or None
@@ -77,10 +139,20 @@ class LLMEngine:
             # Decode run is a separate forward pass to keep prefill kernels unchanged.
             decode_tokens = len(decode_seqs)
             t0 = perf_counter()
-            token_ids = self.model_runner.call("run", decode_seqs, False)
+            if self._profiling_enabled:
+                token_ids, profile = self.model_runner.call("run_profiled", decode_seqs, False)
+            else:
+                token_ids = self.model_runner.call("run", decode_seqs, False)
             decode_time = perf_counter() - t0
+            t_post = perf_counter()
             self.scheduler.postprocess(decode_seqs, token_ids, False, perf_counter())#将计算得到的token_ids存入对应的序列中，并更新块表和状态
+            postprocess_ms = (perf_counter() - t_post) * 1000.0
+            if self._profiling_enabled:
+                self._profile_add("decode", profile, postprocess_ms, decode_tokens)
             outputs.extend([(seq.seq_id, seq.completion_token_ids) for seq in decode_seqs if seq.is_finished])
+
+        if self._profiling_enabled:
+            self._maybe_flush_profile()
 
         return outputs, prefill_tokens, prefill_time, decode_tokens, decode_time
 

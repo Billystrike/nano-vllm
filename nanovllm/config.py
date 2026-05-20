@@ -12,6 +12,9 @@ class Config:
     prefill_chunk_size: int = 0#prefill阶段单个序列每 step 的最大token数，0表示不限制
     prefill_decode_mix: bool = False#是否在同一step内先prefill再decode（两次前向）
     decode_max_num_seqs: int = 0#混合时decode最多调度的序列数，0表示不限制
+    enable_profiling: bool = False#是否启用CUDA event profiling
+    profiling_interval_s: float = 1.0#profiling结果的输出间隔(秒)
+    profiling_path: str = "./profiling.jsonl"#profiling输出路径
     gpu_memory_utilization: float = 0.9
     tensor_parallel_size: int = 1
     enforce_eager: bool = False
@@ -26,5 +29,6 @@ class Config:
         assert 1 <= self.tensor_parallel_size <= 8
         assert self.prefill_chunk_size >= 0
         assert self.decode_max_num_seqs >= 0
+        assert self.profiling_interval_s > 0
         self.hf_config = AutoConfig.from_pretrained(self.model)
         self.max_model_len = min(self.max_model_len, self.hf_config.max_position_embeddings)

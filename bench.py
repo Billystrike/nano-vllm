@@ -15,6 +15,9 @@ def main():
     prefill_chunk_size = 0
     prefill_decode_mix = False
     decode_max_num_seqs = 0
+    enable_profiling = False
+    profiling_interval_s = 1.0
+    profiling_path = "./profiling.jsonl"
 
     path = os.path.expanduser("/home/bstrike/huggingface/models--Qwen--Qwen3-1.7B")
     llm = LLM(
@@ -25,6 +28,9 @@ def main():
         prefill_chunk_size=prefill_chunk_size,
         prefill_decode_mix=prefill_decode_mix,
         decode_max_num_seqs=decode_max_num_seqs,
+        enable_profiling=enable_profiling,
+        profiling_interval_s=profiling_interval_s,
+        profiling_path=profiling_path,
     )
 
     prompt_token_ids = [[randint(0, 10000) for _ in range(randint(100, max_input_len))] for _ in range(num_seqs)]

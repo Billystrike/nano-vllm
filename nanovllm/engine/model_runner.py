@@ -1,4 +1,5 @@
 import pickle
+from time import perf_counter
 import torch
 import torch.distributed as dist
 from multiprocessing.synchronize import Event
@@ -217,6 +218,57 @@ class ModelRunner:
         token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None#如果是rank 0，根据logits和温度张量进行采样，得到token ID；否则为None。
         reset_context()
         return token_ids
+
+    def run_profiled(self, seqs: list[Sequence], is_prefill: bool) -> tuple[list[int] | None, dict]:
+        # Profile CPU prepare time separately from GPU compute.
+        t_prepare = perf_counter()
+        input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
+        prepare_ms = (perf_counter() - t_prepare) * 1000.0
+
+        temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
+
+        # Use CUDA events to measure GPU time for forward and sampling.
+        use_cuda_events = torch.cuda.is_available()
+        if use_cuda_events:
+            run_start = torch.cuda.Event(enable_timing=True)
+            run_end = torch.cuda.Event(enable_timing=True)
+            run_start.record()
+            logits = self.run_model(input_ids, positions, is_prefill)
+            run_end.record()
+        else:
+            t_run = perf_counter()
+            logits = self.run_model(input_ids, positions, is_prefill)
+            run_ms = (perf_counter() - t_run) * 1000.0
+
+        sampler_ms = 0.0
+        if self.rank == 0:
+            if use_cuda_events:
+                sample_start = torch.cuda.Event(enable_timing=True)
+                sample_end = torch.cuda.Event(enable_timing=True)
+                sample_start.record()
+                token_ids = self.sampler(logits, temperatures).tolist()
+                sample_end.record()
+            else:
+                t_sample = perf_counter()
+                token_ids = self.sampler(logits, temperatures).tolist()
+                sampler_ms = (perf_counter() - t_sample) * 1000.0
+        else:
+            token_ids = None
+
+        if use_cuda_events:
+            # Ensure all kernels finish before reading elapsed times.
+            torch.cuda.synchronize()
+            run_ms = run_start.elapsed_time(run_end)
+            if self.rank == 0:
+                sampler_ms = sample_start.elapsed_time(sample_end)
+
+        reset_context()
+        profile = {
+            "prepare_ms": prepare_ms,
+            "run_model_ms": run_ms,
+            "sampler_ms": sampler_ms,
+        }
+        return token_ids, profile
 
     @torch.inference_mode()
     def capture_cudagraph(self):
