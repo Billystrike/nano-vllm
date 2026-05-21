@@ -36,21 +36,56 @@ class Scheduler:
             if remaining == 0:
                 break
             if not seq.block_table:#如果序列没有块表，说明是第一次调度，需要计算可以复用的块数量
-                num_cached_blocks = self.block_manager.can_allocate(seq)
-                if num_cached_blocks == -1:
-                    break
+                cached_block_ids = self.block_manager.get_cached_block_ids(seq)
+                num_cached_blocks = len(cached_block_ids)
                 num_tokens = seq.num_tokens - num_cached_blocks * self.block_size
             else:
+                cached_block_ids = []
                 num_tokens = seq.num_tokens - seq.num_cached_tokens
+            # If all prompt tokens are already cached, move to running without a GPU step.
+            if num_tokens == 0:
+                cached_tokens = (len(cached_block_ids) * self.block_size) if not seq.block_table else seq.num_cached_tokens
+                target_blocks = (cached_tokens + self.block_size - 1) // self.block_size
+                if not seq.block_table:
+                    if not self.block_manager.can_allocate_prefill(cached_block_ids, target_blocks):
+                        # Not enough free blocks to attach cached prefix; try another seq this step.
+                        self.waiting.rotate(-1)
+                        num_waiting -= 1
+                        continue
+                    self.block_manager.ensure_blocks_for_prefill(seq, cached_block_ids, target_blocks)
+                seq.status = SequenceStatus.RUNNING
+                self.waiting.popleft()
+                self.running.append(seq)
+                num_waiting -= 1
+                continue
             # Cap per-step work for this seq to enable chunked prefill.
             scheduled_tokens = min(num_tokens, remaining)
             if self.prefill_chunk_size > 0:
                 scheduled_tokens = min(scheduled_tokens, self.prefill_chunk_size)
             if scheduled_tokens == 0:
-                break
-            if not seq.block_table:#如果序列没有块表，说明是第一次调度，需要分配块
-                # Allocate the full block table once (not on-demand per chunk).
-                self.block_manager.allocate(seq, num_cached_blocks)
+                # No progress for this seq (usually block/remaining budget); try another.
+                self.waiting.rotate(-1)
+                num_waiting -= 1
+                continue
+            # Decide how many KV blocks are needed to cover cached + scheduled tokens.
+            cached_tokens = (len(cached_block_ids) * self.block_size) if not seq.block_table else seq.num_cached_tokens
+            target_tokens = cached_tokens + scheduled_tokens
+            target_blocks = (target_tokens + self.block_size - 1) // self.block_size
+            if not seq.block_table:
+                # On-demand: only ensure blocks up to target_blocks, not full prompt length.
+                if not self.block_manager.can_allocate_prefill(cached_block_ids, target_blocks):
+                    # This seq needs more blocks than available; try another seq.
+                    self.waiting.rotate(-1)
+                    num_waiting -= 1
+                    continue
+                self.block_manager.ensure_blocks_for_prefill(seq, cached_block_ids, target_blocks)
+            else:
+                if not self.block_manager.can_extend(seq, target_blocks):
+                    # This seq needs more blocks than available; try another seq.
+                    self.waiting.rotate(-1)
+                    num_waiting -= 1
+                    continue
+                self.block_manager.ensure_blocks_for_prefill(seq, cached_block_ids, target_blocks)
             seq.num_scheduled_tokens = scheduled_tokens
             num_batched_tokens += seq.num_scheduled_tokens
             self.waiting.popleft()

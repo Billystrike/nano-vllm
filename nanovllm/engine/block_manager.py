@@ -55,41 +55,48 @@ class BlockManager:
         self.used_block_ids.remove(block_id)
         self.free_block_ids.append(block_id)
 
-    def can_allocate(self, seq: Sequence) -> int:
+    def get_cached_block_ids(self, seq: Sequence) -> list[int]:
+        # Find the longest prefix of full blocks that can be reused.
         h = -1
-        num_cached_blocks = 0
-        num_new_blocks = seq.num_blocks
+        cached_block_ids: list[int] = []
         for i in range(seq.num_blocks - 1):
             token_ids = seq.block(i)
             h = self.compute_hash(token_ids, h)
             block_id = self.hash_to_block_id.get(h, -1)
             if block_id == -1 or self.blocks[block_id].token_ids != token_ids:
                 break
-            num_cached_blocks += 1
+            cached_block_ids.append(block_id)
+        return cached_block_ids
+
+    def can_allocate_prefill(self, cached_block_ids: list[int], target_blocks: int) -> bool:
+        # Only blocks already in use do not consume free blocks.
+        num_new_blocks = target_blocks
+        for block_id in cached_block_ids[:target_blocks]:
             if block_id in self.used_block_ids:
                 num_new_blocks -= 1
-        if len(self.free_block_ids) < num_new_blocks:
-            return -1
-        return num_cached_blocks
+        return len(self.free_block_ids) >= num_new_blocks
 
-    def allocate(self, seq: Sequence, num_cached_blocks: int):
-        assert not seq.block_table
-        h = -1
-        for i in range(num_cached_blocks):
-            token_ids = seq.block(i)
-            h = self.compute_hash(token_ids, h)
-            block_id = self.hash_to_block_id[h]
-            block = self.blocks[block_id]
-            if block_id in self.used_block_ids:
-                block.ref_count += 1
-            else:
-                block.ref_count = 1
-                self.free_block_ids.remove(block_id)
-                self.used_block_ids.add(block_id)
-            seq.block_table.append(block_id)
-        for i in range(num_cached_blocks, seq.num_blocks):
+    def can_extend(self, seq: Sequence, target_blocks: int) -> bool:
+        # For an existing seq, we only need to allocate new blocks to reach target_blocks.
+        needed = max(0, target_blocks - len(seq.block_table))
+        return len(self.free_block_ids) >= needed
+
+    def ensure_blocks_for_prefill(self, seq: Sequence, cached_block_ids: list[int], target_blocks: int):
+        # First time: attach cached blocks and set cached token count.
+        if not seq.block_table:
+            for block_id in cached_block_ids:
+                block = self.blocks[block_id]
+                if block_id in self.used_block_ids:
+                    block.ref_count += 1
+                else:
+                    block.ref_count = 1
+                    self.free_block_ids.remove(block_id)
+                    self.used_block_ids.add(block_id)
+                seq.block_table.append(block_id)
+            seq.num_cached_tokens = len(cached_block_ids) * self.block_size
+        # Allocate only the blocks needed for the current prefill target.
+        while len(seq.block_table) < target_blocks:
             seq.block_table.append(self._allocate_block())
-        seq.num_cached_tokens = num_cached_blocks * self.block_size
 
     def deallocate(self, seq: Sequence):
         for block_id in reversed(seq.block_table):

@@ -12,10 +12,11 @@ def main():
     num_seqs = 256
     max_input_len = 1024
     max_ouput_len = 1024
-    prefill_chunk_size = 0
+    # Start with 512 tokens (2 blocks) as a balanced chunk size.
+    prefill_chunk_size = 512
     prefill_decode_mix = False
     decode_max_num_seqs = 0
-    enable_profiling = False
+    enable_profiling = True
     profiling_interval_s = 1.0
     profiling_path = "./profiling.jsonl"
 
