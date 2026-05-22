@@ -187,6 +187,104 @@ class ModelRunner:
         set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
         return input_ids, positions
 
+    def prepare_mixed(self, prefill_seqs: list[Sequence], decode_seqs: list[Sequence]):
+        # Build prefill inputs (varlen) without mixing decode metadata.
+        prefill_input_ids = []
+        prefill_positions = []
+        prefill_cu_seqlens_q = [0]
+        prefill_cu_seqlens_k = [0]
+        prefill_max_seqlen_q = 0
+        prefill_max_seqlen_k = 0
+        prefill_slot_mapping = []
+        prefill_block_tables = None
+        for seq in prefill_seqs:
+            start = seq.num_cached_tokens
+            seqlen_q = seq.num_scheduled_tokens
+            end = start + seqlen_q
+            seqlen_k = end
+            prefill_input_ids.extend(seq[start:end])
+            prefill_positions.extend(range(start, end))
+            prefill_cu_seqlens_q.append(prefill_cu_seqlens_q[-1] + seqlen_q)
+            prefill_cu_seqlens_k.append(prefill_cu_seqlens_k[-1] + seqlen_k)
+            prefill_max_seqlen_q = max(seqlen_q, prefill_max_seqlen_q)
+            prefill_max_seqlen_k = max(seqlen_k, prefill_max_seqlen_k)
+            start_block = start // self.block_size
+            end_block = (end + self.block_size - 1) // self.block_size
+            for i in range(start_block, end_block):
+                slot_start = seq.block_table[i] * self.block_size
+                if i == start_block:
+                    slot_start += start % self.block_size
+                if i != end_block - 1:
+                    slot_end = seq.block_table[i] * self.block_size + self.block_size
+                else:
+                    slot_end = seq.block_table[i] * self.block_size + end - i * self.block_size
+                prefill_slot_mapping.extend(range(slot_start, slot_end))
+        if prefill_seqs and prefill_cu_seqlens_k[-1] > prefill_cu_seqlens_q[-1]:
+            prefill_block_tables = self.prepare_block_tables(prefill_seqs)
+
+        # Build decode inputs (paged attention, one token per seq).
+        decode_input_ids = []
+        decode_positions = []
+        decode_slot_mapping = []
+        decode_context_lens = []
+        decode_block_tables = None
+        for seq in decode_seqs:
+            decode_input_ids.append(seq.last_token)
+            decode_positions.append(len(seq) - 1)
+            decode_context_lens.append(len(seq))
+            decode_slot_mapping.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens - 1)
+        if decode_seqs:
+            decode_block_tables = self.prepare_block_tables(decode_seqs)
+
+        # Concatenate prefill and decode token streams into one batch.
+        input_ids = torch.tensor(
+            prefill_input_ids + decode_input_ids,
+            dtype=torch.int64,
+            pin_memory=True,
+        ).cuda(non_blocking=True)
+        positions = torch.tensor(
+            prefill_positions + decode_positions,
+            dtype=torch.int64,
+            pin_memory=True,
+        ).cuda(non_blocking=True)
+        slot_mapping = torch.tensor(
+            prefill_slot_mapping + decode_slot_mapping,
+            dtype=torch.int32,
+            pin_memory=True,
+        ).cuda(non_blocking=True)
+
+        prefill_cu_seqlens_q = torch.tensor(
+            prefill_cu_seqlens_q,
+            dtype=torch.int32,
+            pin_memory=True,
+        ).cuda(non_blocking=True)
+        prefill_cu_seqlens_k = torch.tensor(
+            prefill_cu_seqlens_k,
+            dtype=torch.int32,
+            pin_memory=True,
+        ).cuda(non_blocking=True)
+        decode_context_lens = torch.tensor(
+            decode_context_lens,
+            dtype=torch.int32,
+            pin_memory=True,
+        ).cuda(non_blocking=True)
+
+        set_context(
+            False,
+            cu_seqlens_q=prefill_cu_seqlens_q,
+            cu_seqlens_k=prefill_cu_seqlens_k,
+            max_seqlen_q=prefill_max_seqlen_q,
+            max_seqlen_k=prefill_max_seqlen_k,
+            slot_mapping=slot_mapping,
+            is_mixed=True,
+            num_prefill_tokens=len(prefill_input_ids),
+            num_decode_tokens=len(decode_input_ids),
+            prefill_block_tables=prefill_block_tables,
+            decode_context_lens=decode_context_lens,
+            decode_block_tables=decode_block_tables,
+        )
+        return input_ids, positions
+
     def prepare_sample(self, seqs: list[Sequence]):
         temperatures = [seq.temperature for seq in seqs]
         temperatures = torch.tensor(temperatures, dtype=torch.float32, pin_memory=True).cuda(non_blocking=True)
@@ -218,6 +316,24 @@ class ModelRunner:
         token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None#如果是rank 0，根据logits和温度张量进行采样，得到token ID；否则为None。
         reset_context()
         return token_ids
+
+    @torch.inference_mode()
+    def run_mixed(self, prefill_seqs: list[Sequence], decode_seqs: list[Sequence]) -> tuple[list[int] | None, list[int] | None]:
+        # Mixed batch: one forward, two attention kernels.
+        input_ids, positions = self.prepare_mixed(prefill_seqs, decode_seqs)
+        all_seqs = prefill_seqs + decode_seqs
+        temperatures = self.prepare_sample(all_seqs) if self.rank == 0 else None
+        # Disable CUDA graph path for mixed batches.
+        logits = self.model.compute_logits(self.model(input_ids, positions))
+        if self.rank == 0:
+            token_ids = self.sampler(logits, temperatures).tolist()
+            prefill_count = len(prefill_seqs)
+            prefill_ids = token_ids[:prefill_count]
+            decode_ids = token_ids[prefill_count:]
+        else:
+            prefill_ids = decode_ids = None
+        reset_context()
+        return prefill_ids, decode_ids
 
     def run_profiled(self, seqs: list[Sequence], is_prefill: bool) -> tuple[list[int] | None, dict]:
         # Profile CPU prepare time separately from GPU compute.
@@ -269,6 +385,68 @@ class ModelRunner:
             "sampler_ms": sampler_ms,
         }
         return token_ids, profile
+
+    @torch.inference_mode()
+    def run_mixed_profiled(
+        self,
+        prefill_seqs: list[Sequence],
+        decode_seqs: list[Sequence],
+    ) -> tuple[list[int] | None, list[int] | None, dict]:
+        # Profile mixed batch as a single forward with two attention kernels.
+        t_prepare = perf_counter()
+        input_ids, positions = self.prepare_mixed(prefill_seqs, decode_seqs)
+        prepare_ms = (perf_counter() - t_prepare) * 1000.0
+
+        all_seqs = prefill_seqs + decode_seqs
+        temperatures = self.prepare_sample(all_seqs) if self.rank == 0 else None
+
+        use_cuda_events = torch.cuda.is_available()
+        if use_cuda_events:
+            run_start = torch.cuda.Event(enable_timing=True)
+            run_end = torch.cuda.Event(enable_timing=True)
+            run_start.record()
+            logits = self.model.compute_logits(self.model(input_ids, positions))
+            run_end.record()
+        else:
+            t_run = perf_counter()
+            logits = self.model.compute_logits(self.model(input_ids, positions))
+            run_ms = (perf_counter() - t_run) * 1000.0
+
+        sampler_ms = 0.0
+        if self.rank == 0:
+            if use_cuda_events:
+                sample_start = torch.cuda.Event(enable_timing=True)
+                sample_end = torch.cuda.Event(enable_timing=True)
+                sample_start.record()
+                token_ids = self.sampler(logits, temperatures).tolist()
+                sample_end.record()
+            else:
+                t_sample = perf_counter()
+                token_ids = self.sampler(logits, temperatures).tolist()
+                sampler_ms = (perf_counter() - t_sample) * 1000.0
+        else:
+            token_ids = None
+
+        if use_cuda_events:
+            torch.cuda.synchronize()
+            run_ms = run_start.elapsed_time(run_end)
+            if self.rank == 0:
+                sampler_ms = sample_start.elapsed_time(sample_end)
+
+        if self.rank == 0:
+            prefill_count = len(prefill_seqs)
+            prefill_ids = token_ids[:prefill_count]
+            decode_ids = token_ids[prefill_count:]
+        else:
+            prefill_ids = decode_ids = None
+
+        reset_context()
+        profile = {
+            "prepare_ms": prepare_ms,
+            "run_model_ms": run_ms,
+            "sampler_ms": sampler_ms,
+        }
+        return prefill_ids, decode_ids, profile
 
     @torch.inference_mode()
     def capture_cudagraph(self):

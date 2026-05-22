@@ -61,6 +61,45 @@ class Attention(nn.Module):
         k_cache, v_cache = self.k_cache, self.v_cache
         if k_cache.numel() and v_cache.numel():
             store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)#将当前步的k和v存入当前层的k_cache和v_cache中，slot_mapping指示了每个序列对应的块ID和块内位置
+        if context.is_mixed:
+            # Mixed batch: split tokens into prefill and decode segments.
+            prefill_tokens = context.num_prefill_tokens
+            decode_tokens = context.num_decode_tokens
+            outputs = []
+            if prefill_tokens > 0:
+                q_prefill = q[:prefill_tokens]
+                k_prefill = k[:prefill_tokens]
+                v_prefill = v[:prefill_tokens]
+                if context.prefill_block_tables is not None:    # prefix cache
+                    k_prefill, v_prefill = k_cache, v_cache
+                o_prefill = flash_attn_varlen_func(
+                    q_prefill,
+                    k_prefill,
+                    v_prefill,
+                    max_seqlen_q=context.max_seqlen_q,
+                    cu_seqlens_q=context.cu_seqlens_q,
+                    max_seqlen_k=context.max_seqlen_k,
+                    cu_seqlens_k=context.cu_seqlens_k,
+                    softmax_scale=self.scale,
+                    causal=True,
+                    block_table=context.prefill_block_tables,
+                )
+                outputs.append(o_prefill)
+            if decode_tokens > 0:
+                q_decode = q[prefill_tokens:prefill_tokens + decode_tokens]
+                o_decode = flash_attn_with_kvcache(
+                    q_decode.unsqueeze(1),
+                    k_cache,
+                    v_cache,
+                    cache_seqlens=context.decode_context_lens,
+                    block_table=context.decode_block_tables,
+                    softmax_scale=self.scale,
+                    causal=True,
+                )
+                outputs.append(o_decode.squeeze(1))
+            if len(outputs) == 1:
+                return outputs[0]
+            return torch.cat(outputs, dim=0)
         if context.is_prefill:
             if context.block_tables is not None:    # prefix cache
                 k, v = k_cache, v_cache

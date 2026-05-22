@@ -10,7 +10,7 @@ class Config:
     max_num_seqs: int = 512#同时处理的请求数量（并发数）的最大上限。
     max_model_len: int = 4096#模型所能支持的单条序列的最大长度（prefill+decode)
     prefill_chunk_size: int = 0#prefill阶段单个序列每 step 的最大token数，0表示不限制
-    prefill_decode_mix: bool = False#是否在同一step内先prefill再decode（两次前向）
+    prefill_decode_mix: bool = False#是否在同一forward内混合prefill+decode（双kernel）
     decode_max_num_seqs: int = 0#混合时decode最多调度的序列数，0表示不限制
     enable_profiling: bool = False#是否启用CUDA event profiling
     profiling_interval_s: float = 1.0#profiling结果的输出间隔(秒)

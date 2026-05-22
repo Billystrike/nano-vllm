@@ -55,7 +55,17 @@ class ParallelLMHead(VocabParallelEmbedding):
 
     def forward(self, x: torch.Tensor):
         context = get_context()
-        if context.is_prefill:
+        if context.is_mixed:
+            parts = []
+            if context.num_prefill_tokens > 0:
+                last_indices = context.cu_seqlens_q[1:] - 1
+                parts.append(x[last_indices].contiguous())
+            if context.num_decode_tokens > 0:
+                start = context.num_prefill_tokens
+                end = start + context.num_decode_tokens
+                parts.append(x[start:end].contiguous())
+            x = torch.cat(parts, dim=0) if len(parts) > 1 else parts[0]
+        elif context.is_prefill:
             last_indices = context.cu_seqlens_q[1:] - 1
             x = x[last_indices].contiguous()#prefill阶段每条序列只计算新增的token，所以每条序列的输出对应的logits也只需要取最后一个token的位置。
         logits = F.linear(x, self.weight)
