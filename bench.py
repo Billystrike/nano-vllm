@@ -1,8 +1,7 @@
 import gc
 import json
-from itertools import product
 import os
-from time import perf_counter
+from time import perf_counter, sleep
 from random import randint, seed
 
 import numpy as np
@@ -12,9 +11,9 @@ from nanovllm import LLM, SamplingParams
 
 
 def run_bench(
-    num_seqs: int,
+    total_requests: int,
+    arrival_interval_s: float,
     prefill_chunk_size: int,
-    prefill_decode_mix: bool,
     gpu_memory_utilization: float,
     max_num_batched_tokens: int,
     max_input_len: int,
@@ -25,7 +24,7 @@ def run_bench(
     seed_base: int,
 ):
     # Keep prompts deterministic per concurrency so configs compare fairly.
-    seed(seed_base + num_seqs)
+    seed(0)
     path = os.path.expanduser("/home/bstrike/huggingface/models--Qwen--Qwen3-1.7B")
     llm = None
     try:
@@ -36,33 +35,40 @@ def run_bench(
             max_num_batched_tokens=max_num_batched_tokens,
             gpu_memory_utilization=gpu_memory_utilization,
             prefill_chunk_size=prefill_chunk_size,
-            prefill_decode_mix=prefill_decode_mix,
-            decode_max_num_seqs=0,
             enable_profiling=enable_profiling,
             profiling_interval_s=profiling_interval_s,
             profiling_path=profiling_path,
         )
 
-        prompt_token_ids = [[randint(0, 10000) for _ in range(randint(100, max_input_len))] for _ in range(num_seqs)]
-        sampling_params = [SamplingParams(temperature=0.6, ignore_eos=True, max_tokens=randint(100, max_output_len)) for _ in range(num_seqs)]
+        prompt_token_ids = [[randint(0, 10000) for _ in range(randint(100, max_input_len))] for _ in range(total_requests)]
+        sampling_params = [SamplingParams(temperature=0.6, ignore_eos=True, max_tokens=randint(100, max_output_len)) for _ in range(total_requests)]
 
         llm.generate(["Benchmark: "], SamplingParams())
-        seq_ids = [llm.add_request(p, sp) for p, sp in zip(prompt_token_ids, sampling_params)]
+        seq_ids = []
+        arrival_times = [i * arrival_interval_s for i in range(total_requests)]
+        next_idx = 0
 
         total_step_time = 0.0
         decode_only_time = 0.0
         decode_only_tokens = 0
-        llm.mixed_steps = 0
-        llm.prefill_only_steps = 0
-        llm.decode_only_steps = 0
-        llm.scheduler.reset_stats()
         t0 = perf_counter()
-        while not llm.is_finished():
-            _, step_time, step_prefill_tokens, step_decode_tokens, is_decode_only = llm.step()
-            total_step_time += step_time
-            if is_decode_only and step_decode_tokens > 0:
-                decode_only_time += step_time
-                decode_only_tokens += step_decode_tokens
+        while next_idx < total_requests or not llm.is_finished():
+            now = perf_counter()
+            elapsed = now - t0
+            # Enqueue all requests whose arrival time has passed.
+            while next_idx < total_requests and elapsed >= arrival_times[next_idx]:
+                seq_ids.append(llm.add_request(prompt_token_ids[next_idx], sampling_params[next_idx]))
+                next_idx += 1
+            if not llm.is_finished():
+                _, step_time, step_prefill_tokens, step_decode_tokens, is_decode_only = llm.step()
+                total_step_time += step_time
+                if is_decode_only and step_decode_tokens > 0:
+                    decode_only_time += step_time
+                    decode_only_tokens += step_decode_tokens
+            else:
+                # No active requests; wait for the next arrival.
+                if next_idx < total_requests:
+                    sleep(min(0.05, max(0.0, arrival_times[next_idx] - elapsed)))
         total_time = perf_counter() - t0
 
         seqs = [llm.seqs[seq_id] for seq_id in seq_ids]
@@ -72,20 +78,11 @@ def run_bench(
         total_tokens = sum(seq.num_completion_tokens for seq in seqs)
         throughput = total_tokens / total_time if total_time > 0 else 0.0
         tpot_mean = (decode_only_time / decode_only_tokens) if decode_only_tokens > 0 else 0.0
-        total_steps = llm.mixed_steps + llm.prefill_only_steps + llm.decode_only_steps
-
         return {
             "ttft_p50": ttft_p50 * 1000.0,
             "ttft_p99": ttft_p99 * 1000.0,
             "tpot": tpot_mean * 1000.0,
             "throughput": throughput,
-            "total_steps": total_steps,
-            "mixed_steps": llm.mixed_steps,
-            "prefill_only": llm.prefill_only_steps,
-            "decode_only": llm.decode_only_steps,
-            "zero_token_promotions": llm.scheduler._zero_token_promotions,
-            "self_preempts": llm.scheduler._self_preempts,
-            "victim_preempts": llm.scheduler._victim_preempts,
         }
     finally:
         if llm is not None:
@@ -104,19 +101,20 @@ def main():
     profiling_path = "./profiling.jsonl"
     seed_base = 0
 
-    concurrencies = [8, 32, 64, 128, 256]
+    total_requests = 16
+    arrival_interval_s = 0.1
     configs = [
-        {"label": "no_chunk", "prefill_chunk_size": 0, "prefill_decode_mix": False},
-        {"label": "chunk_512", "prefill_chunk_size": 512, "prefill_decode_mix": True},
+        {"label": "no_chunk", "prefill_chunk_size": 0},
+        {"label": "chunk_512", "prefill_chunk_size": 512},
     ]
 
     results = []
-    for concurrency, cfg in product(concurrencies, configs):
-        print(f"Running {cfg['label']} @ concurrency={concurrency}")
+    for cfg in configs:
+        print(f"Running {cfg['label']} @ requests={total_requests}, interval={arrival_interval_s:.3f}s")
         metrics = run_bench(
-            num_seqs=concurrency,
+            total_requests=total_requests,
+            arrival_interval_s=arrival_interval_s,
             prefill_chunk_size=cfg["prefill_chunk_size"],
-            prefill_decode_mix=cfg["prefill_decode_mix"],
             gpu_memory_utilization=0.85,
             max_num_batched_tokens=16384,
             max_input_len=max_input_len,
@@ -126,15 +124,16 @@ def main():
             profiling_path=profiling_path,
             seed_base=seed_base,
         )
-        metrics["concurrency"] = concurrency
+        metrics["requests"] = total_requests
+        metrics["arrival_ms"] = arrival_interval_s * 1000.0
         metrics["config"] = cfg["label"]
         results.append(metrics)
 
-    print(f"{'Config':<12} {'Conc':>5} {'TTFT p50':>10} {'TTFT p99':>10} {'TPOT':>8} {'Thpt':>8} {'Steps':>7}")
-    for r in sorted(results, key=lambda r: (r["concurrency"], r["config"])):
+    print(f"{'Config':<12} {'Reqs':>5} {'Arr(ms)':>7} {'TTFT p50':>10} {'TTFT p99':>10} {'TPOT':>8} {'Thpt':>8}")
+    for r in sorted(results, key=lambda r: r["config"]):
         print(
-            f"{r['config']:<12} {r['concurrency']:>5} {r['ttft_p50']:>10.1f} {r['ttft_p99']:>10.1f} "
-            f"{r['tpot']:>8.1f} {r['throughput']:>8.1f} {r['total_steps']:>7}"
+            f"{r['config']:<12} {r['requests']:>5} {r['arrival_ms']:>7.0f} {r['ttft_p50']:>10.1f} {r['ttft_p99']:>10.1f} "
+            f"{r['tpot']:>8.1f} {r['throughput']:>8.1f}"
         )
 
     print("\nRaw JSON")

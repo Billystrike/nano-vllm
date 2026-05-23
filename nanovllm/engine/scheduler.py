@@ -16,14 +16,6 @@ class Scheduler:
         self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size)
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
-        self._zero_token_promotions = 0
-        self._self_preempts = 0
-        self._victim_preempts = 0
-
-    def reset_stats(self):
-        self._zero_token_promotions = 0
-        self._self_preempts = 0
-        self._victim_preempts = 0
 
     def is_finished(self):
         return not self.waiting and not self.running
@@ -32,9 +24,7 @@ class Scheduler:
         self.waiting.append(seq)
 
     def schedule_prefill(self) -> list[Sequence]:
-        # Prefer shorter remaining prompts to improve block utilization and completion speed.
-        if len(self.waiting) > 1:
-            self.waiting = deque(sorted(self.waiting, key=lambda s: s.num_tokens - s.num_cached_tokens))
+        # Keep FIFO order to avoid starving long prompts.
         def preempt_waiting_one() -> bool:
             for _ in range(len(self.waiting)):
                 seq = self.waiting.pop()
@@ -69,7 +59,6 @@ class Scheduler:
                     num_tokens = seq.num_tokens - seq.num_cached_tokens
                 # If all prompt tokens are already cached, move to running without a GPU step.
                 if num_tokens == 0:
-                    self._zero_token_promotions += 1
                     cached_tokens = (len(cached_block_ids) * self.block_size) if not seq.block_table else seq.num_cached_tokens
                     target_blocks = (cached_tokens + self.block_size - 1) // self.block_size
                     if not seq.block_table:
@@ -159,11 +148,9 @@ class Scheduler:
                 if victim is None:
                     # No preemptable seqs; preempt self to free blocks.
                     self.preempt(seq)
-                    self._self_preempts += 1
                     seq = None
                     break
                 self.preempt(victim)
-                self._victim_preempts += 1
             if seq is None:
                 break
             seq.num_scheduled_tokens = 1
@@ -180,7 +167,6 @@ class Scheduler:
         if scheduled_seqs:
             return scheduled_seqs, True
         scheduled_seqs = self.schedule_decode()
-        assert scheduled_seqs
         return scheduled_seqs, False
 
     def preempt(self, seq: Sequence):#当解码阶段的序列无法继续调度时，调用该函数将其抢占回预填充阶段，以腾出块资源给其他序列
